@@ -917,7 +917,10 @@ impl CheckpointMetadata {
             Error::internal(format!("failed to create checkpoint temp file: {}", e))
         })?;
 
-        if let Err(e) = file.write_all(&buf).and_then(|()| file.sync_all()) {
+        if let Err(e) = file
+            .write_all(&buf)
+            .and_then(|()| crate::storage::volume::io::sync_durable(&file))
+        {
             let _ = fs::remove_file(&temp_path);
             return Err(Error::internal(format!(
                 "failed to write checkpoint: {}",
@@ -1478,7 +1481,7 @@ impl WALManager {
         crate::test_failpoints::retired_awaited();
         self.settle_retired()?;
         if let Some(file) = wal_file.as_ref() {
-            file.sync_all()
+            crate::storage::volume::io::sync_durable(file)
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
         }
         // Everything written so far is durable; advance the poison
@@ -2350,7 +2353,7 @@ impl WALManager {
     /// name is owed by every start, a clean old file or not.
     fn sync_retired(file: Option<&File>, dir: &Path) -> Result<()> {
         if let Some(file) = file {
-            file.sync_all()
+            crate::storage::volume::io::sync_durable(file)
                 .map_err(|e| Error::internal(format!("failed to sync WAL file: {}", e)))?;
         }
         Self::sync_directory(dir)

@@ -1057,8 +1057,7 @@ impl SnapshotWriter {
             .map_err(|e| Error::internal(format!("failed to write CRC: {}", e)))?;
 
         // Sync to disk
-        inner
-            .sync_all()
+        crate::storage::volume::io::sync_durable(inner)
             .map_err(|e| Error::internal(format!("failed to sync: {}", e)))?;
 
         Ok(())

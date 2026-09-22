@@ -53,7 +53,7 @@ pub(crate) fn sync_ordered(file: &std::fs::File) -> std::io::Result<()> {
         if !barrier_unsupported(error.raw_os_error()) {
             return Err(error);
         }
-        file.sync_all()
+        sync_durable(file)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -61,16 +61,76 @@ pub(crate) fn sync_ordered(file: &std::fs::File) -> std::io::Result<()> {
     }
 }
 
+/// Makes `file`'s writes durable, asking for the strongest flush the
+/// file system will actually carry out.
+///
+/// On macOS `File::sync_all` is an `F_FULLFSYNC`, which asks the drive
+/// to empty its own write cache; elsewhere it is the platform's plain
+/// full sync. A file system that does not implement the drive flush
+/// refuses the request outright rather than doing less: an SMB mount
+/// answers ENOTSUP, and other network and virtual file systems answer
+/// EINVAL or ENOTTY. Rust's standard library has no fallback, so on
+/// such a mount every WAL sync, checkpoint and snapshot write fails,
+/// and the database reports a write error for data that is perfectly
+/// well written.
+///
+/// When, and only when, the refusal says the call is unimplemented
+/// here, a plain `fsync` stands in. That is the weaker guarantee — the
+/// data has reached the file system, not necessarily the far platters —
+/// but on a network mount the stronger one was never available: a drive
+/// cache flush is local, and the client cannot carry it to the server's
+/// disks. The choice there is between syncing as far as the protocol
+/// reaches and refusing to store anything at all. Any other error is
+/// the write's own and stands.
+pub(crate) fn sync_durable(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        match file.sync_all() {
+            Err(e) if barrier_unsupported(e.raw_os_error()) => {
+                use std::os::unix::io::AsRawFd;
+                loop {
+                    // SAFETY: `file` is borrowed for the call, so the
+                    // descriptor stays open and valid, and fsync does not
+                    // take ownership of it.
+                    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                        return Ok(());
+                    }
+                    let err = std::io::Error::last_os_error();
+                    // A signal is not an answer. `sync_all` above retries
+                    // EINTR inside the standard library; reporting it from
+                    // the fallback would fail a commit, and poison the WAL,
+                    // over something that never touched the storage.
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+            }
+            other => other,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        file.sync_all()
+    }
+}
+
 /// Whether a failed barrier means the file system has none, so that a
-/// full sync stands in: the kernel answers EINVAL or ENOTSUP, and an
-/// older kernel hands the request to a file system that does not know
-/// it, which answers ENOTTY; any other error is the write's own
-#[cfg(any(target_os = "macos", all(test, unix)))]
+/// full sync stands in: the kernel answers EINVAL, ENOTSUP or its
+/// EOPNOTSUPP spelling, and an older kernel hands the request to a file
+/// system that does not know it, which answers ENOTTY; any other error
+/// is the write's own.
+///
+/// The codes are compared rather than matched because ENOTSUP and
+/// EOPNOTSUPP are the same number on Linux but different ones on Darwin
+/// (45 and 102), and a match arm for each would be unreachable where
+/// they coincide.
+#[cfg(unix)]
 fn barrier_unsupported(code: Option<i32>) -> bool {
-    matches!(
-        code,
-        Some(libc::EINVAL) | Some(libc::ENOTSUP) | Some(libc::ENOTTY)
-    )
+    let Some(code) = code else { return false };
+    code == libc::EINVAL
+        || code == libc::ENOTSUP
+        || code == libc::EOPNOTSUPP
+        || code == libc::ENOTTY
 }
 
 /// Volume catalog filename
@@ -782,7 +842,7 @@ impl VolumeCatalog {
             f.write_all(&data).map_err(|e| {
                 crate::core::Error::internal(format!("failed to write volume catalog: {}", e))
             })?;
-            f.sync_all().map_err(|e| {
+            sync_durable(&f).map_err(|e| {
                 crate::core::Error::internal(format!("failed to fsync volume catalog: {}", e))
             })?;
         }
@@ -799,7 +859,7 @@ impl VolumeCatalog {
             let d = std::fs::File::open(dir).map_err(|e| {
                 std::io::Error::other(format!("failed to open dir for fsync: {}", e))
             })?;
-            d.sync_all()
+            sync_durable(&d)
                 .map_err(|e| std::io::Error::other(format!("failed to fsync dir: {}", e)))?;
         }
 
@@ -1208,5 +1268,51 @@ mod sync_tests {
         assert!(super::barrier_unsupported(Some(libc::ENOTTY)));
         assert!(!super::barrier_unsupported(Some(libc::EIO)));
         assert!(!super::barrier_unsupported(None));
+    }
+
+    /// The durable sync has to succeed on every shape of file a writer
+    /// hands it, and on a directory where the platform has one. The
+    /// ENOTSUP fallback itself needs a file system that refuses the
+    /// drive flush — an SMB mount, say — which no temporary directory
+    /// is, so what a local test pins is that the call is wired up and
+    /// that an empty, a small and a multi-block file all report success
+    #[test]
+    fn a_durable_sync_takes_every_file_a_writer_produces() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, len) in [("empty", 0), ("small", 1), ("blocks", 256 * 1024)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, vec![0x5A; len]).unwrap();
+            // Opened for writing, as every caller's file is: Windows
+            // refuses to flush a read-only handle
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            super::sync_durable(&f).unwrap_or_else(|e| panic!("{name}: {e}"));
+            // Nothing left to write is not a reason to fail
+            super::sync_durable(&f).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        #[cfg(not(windows))]
+        super::sync_durable(&std::fs::File::open(dir.path()).unwrap()).unwrap();
+    }
+
+    /// A catalog written to an ordinary directory has to come back
+    /// byte for byte, the sync on its way to disk included
+    #[test]
+    fn a_catalog_survives_the_durable_sync_in_its_write_path() {
+        use super::{VolumeCatalog, VolumeEntry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = VolumeCatalog::new();
+        catalog.add_volume(
+            "t",
+            VolumeEntry {
+                volume_id: 7,
+                row_count: 3,
+                time_min_micros: 1,
+                time_max_micros: 2,
+            },
+        );
+        catalog.write_to_disk(dir.path()).unwrap();
+
+        let loaded = VolumeCatalog::read_from_disk(dir.path()).unwrap();
+        assert_eq!(loaded.get_volumes("t").len(), 1);
     }
 }

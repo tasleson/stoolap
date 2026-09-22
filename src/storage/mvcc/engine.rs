@@ -281,7 +281,7 @@ fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     file.write_all(&buf)
         .map_err(|e| Error::internal(format!("failed to write snapshot metadata: {}", e)))?;
 
-    file.sync_all()
+    crate::storage::volume::io::sync_durable(&file)
         .map_err(|e| Error::internal(format!("failed to sync snapshot metadata: {}", e)))?;
 
     // Atomic rename
@@ -1278,7 +1278,7 @@ impl MVCCEngine {
                             crate::core::Error::internal(format!("failed to write volume: {}", e))
                         })?;
                         std::fs::File::open(&tmp_path)
-                            .and_then(|f| f.sync_all())
+                            .and_then(|f| crate::storage::volume::io::sync_durable(&f))
                             .map_err(|e| {
                                 crate::core::Error::internal(format!(
                                     "failed to sync volume: {}",
@@ -1396,7 +1396,7 @@ impl MVCCEngine {
         if let Err(e) = std::fs::OpenOptions::new()
             .write(true)
             .open(&tmp_path)
-            .and_then(|f| f.sync_all())
+            .and_then(|f| crate::storage::volume::io::sync_durable(&f))
         {
             eprintln!(
                 "Warning: Failed to sync standalone volume for {}: {}",
@@ -4754,7 +4754,7 @@ impl MVCCEngine {
             let ddl_result = (|| -> std::io::Result<()> {
                 let f = std::fs::File::create(&ddl_tmp)?;
                 std::io::Write::write_all(&mut &f, &ddl_buf)?;
-                f.sync_all()?;
+                crate::storage::volume::io::sync_durable(&f)?;
                 std::fs::rename(&ddl_tmp, &ddl_path)?;
                 #[cfg(not(windows))]
                 if let Ok(dir) = std::fs::File::open(&snapshot_dir) {
@@ -4792,7 +4792,7 @@ impl MVCCEngine {
             let manifest_result = (|| -> std::io::Result<()> {
                 let f = std::fs::File::create(&manifest_tmp)?;
                 std::io::Write::write_all(&mut &f, manifest_json.as_bytes())?;
-                f.sync_all()?;
+                crate::storage::volume::io::sync_durable(&f)?;
                 std::fs::rename(&manifest_tmp, &manifest_path)?;
                 Ok(())
             })();

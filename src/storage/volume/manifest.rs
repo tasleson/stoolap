@@ -534,7 +534,7 @@ impl TableManifest {
             let d = std::fs::File::open(parent).map_err(|e| {
                 crate::core::Error::internal(format!("failed to open dir for fsync: {}", e))
             })?;
-            d.sync_all().map_err(|e| {
+            super::io::sync_durable(&d).map_err(|e| {
                 crate::core::Error::internal(format!("failed to fsync manifest dir: {}", e))
             })?;
         }

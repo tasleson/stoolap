@@ -2241,7 +2241,7 @@ fn build_side_file_staged(
     out.write_all(&MAGIC)?;
     out.flush()?;
     let file = out.into_inner().map_err(|e| e.into_error())?;
-    file.sync_all()?;
+    super::io::sync_durable(&file)?;
     drop(file);
     // Each owner before the charge that backs it
     drop(dir);
